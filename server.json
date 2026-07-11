@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jperelli/graylog-mcp",
+  "description": "Query logs from one or more Graylog instances: discover streams, search messages, aggregate by field, and fetch full documents.",
+  "title": "Graylog MCP Server",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/jperelli/graylog-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@jperelli/graylog-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "GRAYLOG_BASE_URL_INSTANCE_1",
+          "description": "Base URL of the first Graylog instance, e.g. http://graylog.example.com:9000",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "GRAYLOG_API_TOKEN_INSTANCE_1",
+          "description": "API token for the first Graylog instance (used as the HTTP Basic username).",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "GRAYLOG_LABEL_INSTANCE_1",
+          "description": "Optional human-readable label for the first instance (default: instance_1).",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
