@@ -39,13 +39,14 @@ No installation needed, `npx` downloads and runs the server automatically.
 ### Claude Code
 
 ```bash
-claude mcp add graylog-mcp npx @jperelli/graylog-mcp@latest \
+claude mcp add graylog-mcp \
   -e GRAYLOG_BASE_URL_INSTANCE_1=http://your-graylog-production.example.com:9000 \
   -e GRAYLOG_API_TOKEN_INSTANCE_1=your_production_token \
   -e GRAYLOG_LABEL_INSTANCE_1=production \
   -e GRAYLOG_BASE_URL_INSTANCE_2=http://your-graylog-staging.example.com:9000 \
   -e GRAYLOG_API_TOKEN_INSTANCE_2=your_staging_token \
-  -e GRAYLOG_LABEL_INSTANCE_2=staging
+  -e GRAYLOG_LABEL_INSTANCE_2=staging \
+  -- npx -y @jperelli/graylog-mcp@latest
 ```
 
 Or add it manually to `~/.claude.json`:
@@ -55,7 +56,7 @@ Or add it manually to `~/.claude.json`:
   "mcpServers": {
     "graylog-mcp": {
       "command": "npx",
-      "args": ["@jperelli/graylog-mcp@latest"],
+      "args": ["-y", "@jperelli/graylog-mcp@latest"],
       "env": {
         "GRAYLOG_BASE_URL_INSTANCE_1":  "http://your-graylog-production.example.com:9000",
         "GRAYLOG_API_TOKEN_INSTANCE_1": "your_production_token",
@@ -79,7 +80,7 @@ Add to `~/.cursor/mcp.json`:
   "mcpServers": {
     "graylog-mcp": {
       "command": "npx",
-      "args": ["@jperelli/graylog-mcp@latest"],
+      "args": ["-y", "@jperelli/graylog-mcp@latest"],
       "env": {
         "GRAYLOG_BASE_URL_INSTANCE_1":  "http://your-graylog-production.example.com:9000",
         "GRAYLOG_API_TOKEN_INSTANCE_1": "your_production_token",
