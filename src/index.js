@@ -76,23 +76,49 @@ const REQUEST_TIMEOUT_MS = 30000;
 // server instructions.
 const SERVER_INSTRUCTIONS = `Query logs from one or more Graylog instances.
 
-Workflow: call \`list_streams\` first to discover stream IDs, then pass them to
-\`search\` (raw messages) or \`analyze\` (aggregate counts). Use \`get_message\` to
-fetch the full, untruncated document for a single hit returned by \`search\`.
+Start here: you usually do NOT need \`list_streams\`. Pass the Default Stream id
+"${DEFAULT_STREAM_ID}" as \`streams\` to search everything the token can see.
+A cluster can have thousands of streams, so only call \`list_streams\` (with
+\`titleContains\`) when you specifically need to scope to one named stream.
+
+Do not guess field names or values — the wrong guess looks exactly like "no
+logs exist". Discover them first:
+- \`list_fields\` (with \`contains\`) → which fields are actually indexed.
+- \`analyze\` with \`valueContains\` → which values a field actually has, e.g.
+  the real namespace/pod/service name. This is the ONLY way to substring-match a
+  value: Elasticsearch rejects a leading wildcard, so \`field:*foo*\` is an error.
+
+Then \`search\` for raw lines, and \`get_message\` for one hit's full document.
+
+Prefer \`analyze\` over \`search\` to find out WHAT is happening. Aggregating by a
+message field (\`analyze\` on \`msg\`, or on whatever short summary field
+\`list_fields\` shows) collapses a thousand repetitions of one error into one row
+with a count. Reading the same thing as raw lines costs hundreds of times more
+context and tells you less. Use \`search\` once you know which line you want.
 
 Key constraints and quirks:
-- Stream IDs are mandatory for search/analyze. There is no implicit all-streams
-  search: a limited-permission token is rejected with 403. To search everything
-  the token can see (including messages not routed to a named stream), use the
-  Default Stream id "${DEFAULT_STREAM_ID}".
+- \`streams\` is mandatory for search/analyze. There is no implicit all-streams
+  search: a limited-permission token is rejected with 403.
 - Query syntax is Graylog/Elasticsearch Lucene: e.g. \`level:ERROR\`,
-  \`source:api-*\`, \`error OR exception\`, \`*\` for everything. A quoted string
-  before ':' (e.g. \`"level":50\`) is invalid Lucene — do not use it.
-- Log severity is not uniform. Some services emit a top-level Graylog \`level\`
-  field (syslog: 3=error, 4=warn); others (e.g. pino) log severity as a numeric
-  field INSIDE the JSON body (\`{"level":50}\`=error, \`40\`=warn) that is not the
-  Graylog level. When \`level:ERROR\` finds nothing, filter by text instead
-  (\`error OR exception\`, \`msg:Error\`).
+  \`source:api-*\`, \`error OR exception\`, \`*\` for everything. Two things are
+  hard errors, not empty results: a quoted string before ':' (\`"level":50\`),
+  and a leading wildcard (\`*foo\`, \`field:*foo*\`).
+- SEVERITY IS NOT UNIFORM, AND MUST BE DISCOVERED — do not guess a spelling.
+  Some services emit a top-level Graylog \`level\` (syslog: 3=error, 4=warn).
+  Others log JSON, and the shipper extracts its keys into their OWN fields:
+  pino's \`{"level":50,"msg":"Error","name":"SvcX"}\` typically becomes fields
+  \`msg\` and \`name\`, while its numeric \`level\` is LOST — it collides with the
+  container's own \`level\` (often 7), so \`level:50\` and \`level:ERROR\` both match
+  NOTHING even though errors are plainly there. Find the real handle instead of
+  guessing a disjunction: run \`list_fields\` (contains "level", "msg", "err"),
+  then \`analyze\` on \`msg\` to see the actual severity/message values. Free-text
+  (\`error\`) works as a fallback, but do not assume \`exception\` or \`fatal\` are
+  present — on many deployments they match nothing.
+- A log line is only searchable once Graylog has INDEXED it, which can lag
+  ingestion by hours when the pipeline is backed up. In that state a correct
+  query over a recent window truthfully returns 0 matches. \`search\` detects
+  this and reports the indexing lag alongside an empty result — read that note
+  before concluding the logs do not exist, and widen the time range.
 - \`search\` returns a concise projection of high-signal fields by default to
   save context. Pass \`verbose:true\` for every populated field, or \`fields\` for
   a specific set. Long message bodies are truncated unless verbose.
@@ -165,6 +191,111 @@ async function graylogGet(instance, path, params = {}) {
   return data ?? {};
 }
 
+// Authenticated POST with a JSON body. Same auth/CSRF rules as graylogGet; the
+// Views search API (see viewsSearch) is POST-only.
+async function graylogPost(instance, path, body) {
+  const auth = Buffer.from(`${instance.apiToken}:token`).toString("base64");
+  let resp;
+  try {
+    resp = await fetch(new URL(instance.baseUrl + path), {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-Requested-By": "graylog-mcp",
+        Authorization: `Basic ${auth}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (cause) {
+    if (cause?.name === "TimeoutError") {
+      throw new Error(`Request to ${instance.label} timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw cause;
+  }
+
+  const raw = await resp.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = raw;
+  }
+
+  if (!resp.ok) {
+    const err = new Error(`Request failed with status code ${resp.status}`);
+    err.response = { status: resp.status, data };
+    throw err;
+  }
+  return data ?? {};
+}
+
+// Run one Views/Aggregations search and return its search_types results.
+//
+// This replaces the legacy /api/search/universal/{relative,absolute}/{terms,histogram}
+// endpoints, which Graylog 6.0 REMOVED (they 404 there while the plain search
+// endpoint still answers). Unlike the legacy API this accepts every stream in a
+// single request, so there is no fan-out to merge.
+//
+// Careful: a query that fails inside Elasticsearch still comes back HTTP 200,
+// with `completed_exceptionally` set and the reason in `errors`. Surface that as
+// an error instead of silently reporting zero results.
+async function viewsSearch(instance, { query, streams, timerange, searchTypes }) {
+  const body = {
+    queries: [
+      {
+        id: "q",
+        query: { type: "elasticsearch", query_string: query },
+        timerange,
+        filter: { type: "or", filters: streams.map((id) => ({ type: "stream", id })) },
+        search_types: searchTypes,
+      },
+    ],
+  };
+
+  const data = await graylogPost(instance, "/api/views/search/sync", body);
+  const result = data?.results?.q;
+  const errors = result?.errors ?? [];
+
+  if (errors.length > 0) {
+    const err = new Error(errors.map((e) => e.description ?? String(e)).join("; "));
+    err.response = { status: 200, data: { errors } };
+    throw err;
+  }
+  return result?.search_types ?? {};
+}
+
+// Run a Views search, dropping any stream the token cannot read rather than
+// failing outright. The Views API takes every stream in one request, so a single
+// unreadable stream would 403 the whole call — but the 403 body names the
+// offending streams (MissingStreamPermission), so we can drop them and retry once
+// and still answer from the readable ones. Costs one extra request, only on 403.
+async function viewsSearchTolerant(instance, params) {
+  try {
+    const results = await viewsSearch(instance, params);
+    return { results, streams: params.streams, denied: [] };
+  } catch (error) {
+    const denied = error.response?.status === 403 ? (error.response.data?.streams ?? []) : [];
+    const readable = params.streams.filter((s) => !denied.includes(s));
+    // Nothing identifiable to drop, or nothing left to search: a real failure.
+    if (denied.length === 0 || readable.length === 0) throw error;
+
+    const results = await viewsSearch(instance, { ...params, streams: readable });
+    return { results, streams: readable, denied };
+  }
+}
+
+// Pull (value, count) pairs out of a pivot result. Graylog returns one "leaf" row
+// per bucket — key[0] is the bucket, values[0].value the count — plus a trailing
+// "non-leaf" rollup row with an empty key holding the grand total.
+function pivotRows(searchType) {
+  const rows = searchType?.rows ?? [];
+  return rows
+    .filter((r) => Array.isArray(r.key) && r.key.length > 0)
+    .map((r) => ({ value: r.key[0], count: r.values?.[0]?.value ?? 0 }));
+}
+
 function resolveInstance(args) {
   const requestedLabel = args.instance ?? DEFAULT_INSTANCE?.label;
   const instance = INSTANCE_BY_LABEL[requestedLabel] ?? null;
@@ -197,7 +328,11 @@ function errorResult(instance, action, error) {
 
   // Steer the agent toward the next useful action instead of just reporting a code.
   let hint = "";
-  if (status === 403) {
+  if (/not allowed as first character/i.test(error.message)) {
+    hint =
+      "\nHint: Elasticsearch rejects a leading wildcard, so `field:*foo*` can never work. " +
+      "To find a value you only half-know, use analyze with `valueContains` instead.";
+  } else if (status === 403) {
     hint =
       "\nHint: the token likely lacks read access to one of the requested streams. " +
       "Call list_streams to see which streams this token can read, and search only those.";
@@ -205,6 +340,11 @@ function errorResult(instance, action, error) {
     hint =
       "\nHint: the query may be invalid Lucene. Avoid a quoted string before ':' " +
       '(e.g. "level":50); try `error OR exception` or `*` to confirm connectivity.';
+  } else if (status === 404) {
+    hint =
+      "\nHint: this Graylog does not expose that endpoint. The legacy universal-search " +
+      "terms/histogram sub-resources were removed in Graylog 6.0; aggregation now goes " +
+      "through the Views API.";
   }
 
   return textResult(
@@ -238,39 +378,77 @@ async function fanOut(streams, worker) {
   return { results, failures };
 }
 
-// One-line, agent-actionable warning for streams that failed in a partial fan-out.
-function partialWarning(failures, totalStreams) {
-  const detail = failures
-    .map(
-      (f) => `${f.stream}${f.error.response?.status ? ` (HTTP ${f.error.response.status})` : ""}`,
-    )
+// One-line, agent-actionable warning for streams that had to be excluded. Takes
+// [{ stream, status? }] so both the fan-out (search) and the retry-without-denied
+// path (analyze) can report the same way.
+function partialWarning(excluded, totalStreams) {
+  const detail = excluded
+    .map((e) => `${e.stream}${e.status ? ` (HTTP ${e.status})` : ""}`)
     .join(", ");
   return (
-    `${failures.length} of ${totalStreams} streams could not be queried and are excluded from these results: ${detail}. ` +
+    `${excluded.length} of ${totalStreams} streams could not be queried and are excluded from these results: ${detail}. ` +
+    `The results below cover the remaining readable streams. ` +
     `Call list_streams to confirm which streams this token can read.`
   );
 }
 
+const DEFAULT_RANGE_SECONDS = 900;
+
 // Build the universal-search path and time params, choosing the absolute endpoint
 // when an ISO from/to window is supplied, otherwise the relative one.
-// `kind` is "" (messages), "terms", or "histogram".
+//
+// Only the plain message endpoint is reachable this way: Graylog 6.0 removed the
+// /terms and /histogram sub-resources, so aggregation goes through viewsSearch.
 function buildSearch(args) {
-  const sub = "";
   if (args.from && args.to) {
     return {
-      makePath: (k) => `/api/search/universal/absolute${k ? `/${k}` : sub}`,
+      path: "/api/search/universal/absolute",
       time: { from: args.from, to: args.to },
     };
   }
-  const range = args.searchTimeRangeInSeconds ?? 900;
   return {
-    makePath: (k) => `/api/search/universal/relative${k ? `/${k}` : sub}`,
-    time: { range },
+    path: "/api/search/universal/relative",
+    time: { range: args.searchTimeRangeInSeconds ?? DEFAULT_RANGE_SECONDS },
   };
 }
 
+// The Views API is stricter than the legacy one: it wants real ISO-8601, so
+// accept the "2026-07-12 00:00:00" form the legacy endpoint tolerates and lift it.
+function toIso(value) {
+  const parsed = new Date(String(value).includes("T") ? value : String(value).replace(" ", "T"));
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(
+      `Invalid timestamp "${value}" — use ISO-8601 UTC, e.g. "2026-07-12T14:00:00Z".`,
+    );
+  }
+  return parsed.toISOString();
+}
+
+// Same window as buildSearch, in the shape the Views API expects.
+function viewsTimeRange(args) {
+  if (args.from && args.to) {
+    return { type: "absolute", from: toIso(args.from), to: toIso(args.to) };
+  }
+  return { type: "relative", range: args.searchTimeRangeInSeconds ?? DEFAULT_RANGE_SECONDS };
+}
+
+// Graylog's legacy histogram took a bare unit name; the Views API takes a timeunit.
+const HISTOGRAM_TIMEUNITS = {
+  minute: "1m",
+  hour: "1h",
+  day: "1d",
+  week: "1w",
+  month: "1M",
+};
+
 // High-signal fields kept in the concise projection, in output order. Only those
 // actually populated on a message are emitted.
+//
+// `msg`, `name`, `err` and `stack` matter as much as the k8s ones: a shipper that
+// parses a JSON log line (pino, bunyan, structlog) extracts its keys into real
+// fields, so these carry the summary of the event. Without them the projection
+// falls back to the raw `message` — the whole JSON blob that *contains* them —
+// which is how a 50-hit search used to cost ~37k tokens.
 const CONCISE_FIELDS = [
   "timestamp",
   "source",
@@ -281,19 +459,27 @@ const CONCISE_FIELDS = [
   "application_name",
   "service",
   "logger_name",
+  "name",
+  "msg",
+  "err",
+  "stack",
   "message",
 ];
-const MAX_MESSAGE_CHARS = 2000;
 
-function projectConcise(msg, index) {
+// The raw body is mostly redundant with the fields above once a JSON line has been
+// parsed, so keep only enough to recognise it. `messageChars` raises this, and
+// get_message returns the document whole.
+const DEFAULT_MESSAGE_CHARS = 500;
+
+function projectConcise(msg, index, maxMessageChars = DEFAULT_MESSAGE_CHARS) {
   const out = {};
   for (const f of CONCISE_FIELDS) {
     if (msg[f] !== undefined && msg[f] !== null) out[f] = msg[f];
   }
-  if (typeof out.message === "string" && out.message.length > MAX_MESSAGE_CHARS) {
+  if (typeof out.message === "string" && out.message.length > maxMessageChars) {
     out.message =
-      out.message.slice(0, MAX_MESSAGE_CHARS) +
-      `…[truncated ${out.message.length - MAX_MESSAGE_CHARS} chars — use get_message for the full body]`;
+      out.message.slice(0, maxMessageChars) +
+      `…[truncated ${out.message.length - maxMessageChars} chars — raise messageChars, or use get_message for the full body]`;
   }
   // Identifiers needed to drill into the full document via get_message.
   if (msg._id !== undefined) out._id = msg._id;
@@ -343,15 +529,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "list_streams",
         description:
-          "List the Graylog streams the API token can read (id + title). Call this first to " +
-          "get stream IDs for search/analyze; only readable streams are returned.",
+          "List the Graylog streams the API token can read (id + title). You usually do NOT need " +
+          `this: pass the Default Stream id "${DEFAULT_STREAM_ID}" to search everything the token ` +
+          "can see. A cluster can hold thousands of streams, so results are capped — use " +
+          "`titleContains` when you need one specific named stream.",
         inputSchema: {
           type: "object",
           properties: {
             instance: instanceProp,
             titleContains: {
               type: "string",
-              description: "Optional case-insensitive substring filter on the stream title.",
+              description: "Case-insensitive substring filter on the stream title.",
+            },
+            limit: {
+              type: "number",
+              description: "Max streams to return. Default: 50.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "list_fields",
+        description:
+          "List the message fields that actually exist in the index. Use this BEFORE searching " +
+          "on a field you have not seen in a result, so you never guess a field name — a query " +
+          "on a nonexistent field returns 0 matches, which is indistinguishable from 'no logs'. " +
+          'Clusters index thousands of fields, so pass `contains` to narrow (e.g. "namespace").',
+        inputSchema: {
+          type: "object",
+          properties: {
+            instance: instanceProp,
+            contains: {
+              type: "string",
+              description:
+                'Case-insensitive substring filter on the field name, e.g. "namespace", "pod", "level".',
+            },
+            limit: {
+              type: "number",
+              description: "Max field names to return. Default: 100.",
             },
           },
           required: [],
@@ -360,9 +576,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "search",
         description:
-          "Search log messages across one or more streams; results merged newest-first. " +
+          "Read individual matching log lines across one or more streams, merged newest-first. " +
           "Returns a concise projection of high-signal fields by default (set verbose:true for " +
-          "all fields). Use this to read individual matching log lines.",
+          "all fields). Raw lines are expensive: if you want to know WHAT is failing rather than " +
+          "read specific lines, use analyze first — a hundred repetitions of one error cost a " +
+          "hundred times as much here as one aggregated count.",
         inputSchema: {
           type: "object",
           properties: {
@@ -381,6 +599,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Return every populated field (untruncated) instead of the concise projection. Default: false.",
             },
+            messageChars: {
+              type: "number",
+              description:
+                `Max characters of the raw message body per hit. Default: ${DEFAULT_MESSAGE_CHARS}. ` +
+                "The parsed fields (msg, name, err) usually carry the summary already, so raise " +
+                "this only when the detail you need lives in the raw body.",
+            },
             fields: {
               type: "string",
               description:
@@ -393,10 +618,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "analyze",
         description:
-          "Aggregate matching messages by the top values of a field (e.g. which sources, " +
-          "containers, or levels dominate) instead of returning raw lines. Optionally add a " +
-          "time histogram of match volume. Use this first during an incident to find patterns " +
-          "cheaply before drilling in with search.",
+          "Aggregate matching messages by the top values of a field instead of returning raw " +
+          "lines. Optionally add a time histogram of match volume. Three main uses: " +
+          "(1) WHAT IS FAILING — aggregate on a message field (`msg`, or whatever short summary " +
+          "field list_fields reveals) to collapse a thousand repetitions of one error into one " +
+          "row with a count; on `name`/`container_name`/`source` to see who is emitting them. " +
+          "This is far cheaper and more informative than reading the same lines via search. " +
+          "(2) WHEN — set histogramInterval to see whether volume spiked. " +
+          "(3) DISCOVER A VALUE you are about to filter on — set `valueContains` to find the " +
+          "real name of a namespace/pod/service rather than guessing it (Elasticsearch rejects " +
+          "a leading wildcard, so `field:*foo*` is an error and this is the only way to " +
+          "substring-match a value).",
         inputSchema: {
           type: "object",
           properties: {
@@ -404,7 +636,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             field: {
               type: "string",
               description:
-                'Field to break down by, e.g. "source", "container_name", "level", "status_code".',
+                'Field to break down by, e.g. "source", "namespace_name", "container_name", "level". ' +
+                "Confirm it exists with list_fields if you have not seen it in a result.",
             },
             query: {
               ...queryProp,
@@ -417,6 +650,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             size: {
               type: "number",
               description: "Number of top values to return. Default: 20.",
+            },
+            valueContains: {
+              type: "string",
+              description:
+                "Case-insensitive substring filter on the returned VALUES, applied locally over a " +
+                'wide bucket scan. Use to find a value you only half-know, e.g. field:"namespace_name" ' +
+                'valueContains:"catalogue" to learn the exact namespace before filtering on it.',
             },
             histogramInterval: {
               type: "string",
@@ -457,6 +697,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   switch (request.params.name) {
     case "list_streams":
       return listStreams(request);
+    case "list_fields":
+      return listFields(request);
     case "search":
       return searchMessages(request);
     case "analyze":
@@ -481,10 +723,10 @@ async function listStreams(request) {
     const data = await graylogGet(instance, "/api/streams");
 
     const filter = args.titleContains?.toLowerCase();
+    const limit = args.limit ?? 50;
     let streams = (data?.streams ?? []).map((s) => ({
       id: s.id,
       title: s.title,
-      description: s.description,
       disabled: s.disabled,
     }));
 
@@ -492,32 +734,60 @@ async function listStreams(request) {
     // is searchable and is where messages not routed to a named stream land
     // (searching it is effectively "search everything this token can see").
     // Surface it explicitly so it is discoverable, if the token can read it.
+    let defaultStream = null;
     if (!streams.some((s) => s.id === DEFAULT_STREAM_ID)) {
       try {
         const def = await graylogGet(instance, `/api/streams/${DEFAULT_STREAM_ID}`);
-        streams.unshift({
+        defaultStream = {
           id: def?.id ?? DEFAULT_STREAM_ID,
           title: def?.title ?? "All messages",
-          description: `${def?.description ?? "Default stream"} (default — contains messages not routed to a named stream; search it to query everything)`,
           disabled: def?.disabled ?? false,
-        });
+        };
       } catch {
         /* token cannot read the default stream — skip it */
       }
     }
+
+    const totalReadable = streams.length + (defaultStream ? 1 : 0);
 
     if (filter) {
       streams = streams.filter((s) => (s.title ?? "").toLowerCase().includes(filter));
     }
     streams.sort((a, b) => (a.title ?? "").localeCompare(b.title ?? ""));
 
+    const matched = streams.length;
+    streams = streams.slice(0, limit);
+    // Keep the default stream pinned to the top and outside the cap: it is the one
+    // stream the caller almost always wants, and it must not be truncated away.
+    if (defaultStream && !filter) streams.unshift(defaultStream);
+
     if (process.env.DEBUG === "true") {
       console.error(
-        `[graylog-mcp] instance=${instance.label} list_streams count=${streams.length}`,
+        `[graylog-mcp] instance=${instance.label} list_streams total=${totalReadable} returned=${streams.length}`,
       );
     }
 
-    return jsonResult({ total: streams.length, streams });
+    const result = {
+      total_readable: totalReadable,
+      matched,
+      returned: streams.length,
+      default_stream_id: DEFAULT_STREAM_ID,
+      streams,
+    };
+    if (filter) result.title_contains = args.titleContains;
+    if (matched > streams.length || (!filter && totalReadable > limit)) {
+      result.note =
+        `${matched} of ${totalReadable} readable streams matched; showing ${streams.length}. ` +
+        `Narrow with \`titleContains\`, raise \`limit\`, or just search the Default Stream ` +
+        `("${DEFAULT_STREAM_ID}"), which covers everything this token can read.`;
+    }
+    if (filter && matched === 0) {
+      result.why_no_results =
+        `No stream title contains "${args.titleContains}". Search the Default Stream ` +
+        `("${DEFAULT_STREAM_ID}") instead — it covers everything this token can read — and ` +
+        `filter by a field such as namespace_name or source.`;
+    }
+    return jsonResult(result);
   } catch (error) {
     return errorResult(instance, "listing streams", error);
   }
@@ -526,6 +796,100 @@ async function listStreams(request) {
 // ---------------------------------------------------------------------------
 // search
 // ---------------------------------------------------------------------------
+
+// Work out WHY a search matched nothing, so an empty result is actionable instead
+// of ambiguous. Three causes look identical from a bare `total_matched: 0`:
+//   1. the query is wrong (bad field name or value) — but the window has data;
+//   2. the window is genuinely empty for these streams;
+//   3. the logs exist but Graylog has not INDEXED them yet, because message
+//      processing is lagging behind ingestion (this can run to hours), in which
+//      case a correct query over a recent window honestly returns nothing.
+// Distinguishing (3) matters most: the logs are there, just not searchable yet.
+// Only runs on a zero-match search, and only makes cheap capped probes.
+async function diagnoseEmpty(instance, { streams, time, path }) {
+  const probe = async (params) => {
+    const { results } = await fanOut(streams, (streamId) =>
+      graylogGet(instance, params.path ?? path, {
+        query: "*",
+        ...(params.time ?? time),
+        limit: 1,
+        filter: `streams:${streamId}`,
+      }),
+    );
+    const total = results.reduce((n, r) => n + (r.total_results ?? 0), 0);
+    const newest = results
+      .flatMap((r) => r.messages ?? [])
+      .map((m) => m.message ?? m)
+      .sort((a, b) => String(b.timestamp ?? "").localeCompare(String(a.timestamp ?? "")))[0];
+    return { total, newest };
+  };
+
+  try {
+    // Does the requested window hold ANY message for these streams?
+    const inWindow = await probe({});
+    if (inWindow.total > 0) {
+      return (
+        `The query matched 0 of the ${inWindow.total} messages in this window, so the streams and ` +
+        `time range are fine — the query itself is almost certainly wrong. Verify the field exists ` +
+        `with list_fields, and that the value exists with analyze (valueContains), before assuming ` +
+        `these logs do not exist.`
+      );
+    }
+
+    // The window is empty. Look further back for the newest message Graylog has
+    // actually indexed: if that is well in the past, indexing is behind and recent
+    // logs are simply not searchable yet.
+    const recent = await probe({
+      path: "/api/search/universal/relative",
+      time: { range: 86400 },
+    });
+
+    if (!recent.newest) {
+      return (
+        `These streams hold no indexed messages in the last 24h at all. Check the stream ids ` +
+        `(list_streams) — or the token may not be able to read them.`
+      );
+    }
+
+    const newestTs = new Date(recent.newest.timestamp);
+    const lagSeconds = Math.round((Date.now() - newestTs.getTime()) / 1000);
+    const lagText =
+      lagSeconds > 3600
+        ? `${(lagSeconds / 3600).toFixed(1)}h`
+        : `${Math.max(0, Math.round(lagSeconds / 60))}m`;
+
+    let note =
+      `This window contains no indexed messages at all. The newest message Graylog has indexed ` +
+      `for these streams is ${recent.newest.timestamp} (${lagText} old).`;
+
+    // Anything beyond a few minutes stale points at a processing backlog rather
+    // than a genuinely quiet service.
+    if (lagSeconds > 600) {
+      note +=
+        ` That is well in the past, so Graylog is very likely still INDEXING: the logs probably ` +
+        `exist but are not searchable yet. Do not conclude they are missing — either search an ` +
+        `older window that ends before ${recent.newest.timestamp}, or retry later.`;
+      try {
+        const journal = await graylogGet(instance, "/api/system/journal");
+        const backlog = journal?.uncommitted_journal_entries;
+        if (typeof backlog === "number") {
+          note +=
+            ` Journal backlog: ${backlog.toLocaleString()} uncommitted entries ` +
+            `(append ${journal.append_events_per_second ?? "?"}/s vs read ` +
+            `${journal.read_events_per_second ?? "?"}/s).`;
+        }
+      } catch {
+        /* journal needs extra permissions — the timestamp above is enough */
+      }
+    } else {
+      note += ` Indexing looks current, so these streams are simply quiet in this window.`;
+    }
+    return note;
+  } catch {
+    // Diagnosis is best-effort: never turn a successful empty search into an error.
+    return null;
+  }
+}
 
 async function searchMessages(request) {
   const args = request.params.arguments ?? {};
@@ -545,7 +909,7 @@ async function searchMessages(request) {
     );
   }
 
-  const { makePath, time } = buildSearch(args);
+  const { path, time } = buildSearch(args);
 
   // The legacy universal search returns the FULL message object (every populated
   // field) as JSON, but only accepts one stream per request. So fan out over the
@@ -560,7 +924,7 @@ async function searchMessages(request) {
       };
       // When the caller asks for explicit fields, push the projection to Graylog.
       if (explicitFields) params.fields = explicitFields;
-      const data = await graylogGet(instance, makePath(""), params);
+      const data = await graylogGet(instance, path, params);
       // Preserve each hit's index alongside its message so we can build _index.
       const messages = (data.messages ?? []).map((m) => ({
         msg: m.message ?? m,
@@ -579,7 +943,7 @@ async function searchMessages(request) {
     const messages = merged.map(({ msg, index }) =>
       verbose || explicitFields
         ? { ...msg, _index: index ?? msg._index }
-        : projectConcise(msg, index),
+        : projectConcise(msg, index, args.messageChars ?? DEFAULT_MESSAGE_CHARS),
     );
 
     if (process.env.DEBUG === "true") {
@@ -594,18 +958,27 @@ async function searchMessages(request) {
       streams,
       messages,
     };
-    if (totalMatched > messages.length) {
+    if (totalMatched === 0) {
+      // An empty result is the single biggest source of wasted follow-up queries:
+      // say which of "wrong query" / "quiet window" / "not indexed yet" it is.
+      const why = await diagnoseEmpty(instance, { streams, time, path });
+      if (why) result.why_no_results = why;
+    } else if (totalMatched > messages.length) {
       result.note =
         `Showing the newest ${messages.length} of ${totalMatched} matches. To see more, ` +
         `narrow the query, shorten the time range, raise searchCountLimit, or use analyze to aggregate.`;
     }
     if (!verbose && !explicitFields) {
       result.projection =
-        "concise (high-signal fields only; set verbose:true or use get_message for full documents)";
+        "concise (high-signal fields only, raw message body truncated; raise messageChars, " +
+        "set verbose:true, or use get_message for full documents)";
     }
     if (failures.length) {
       result.failed_streams = failures.map((f) => f.stream);
-      result.warning = partialWarning(failures, streams.length);
+      result.warning = partialWarning(
+        failures.map((f) => ({ stream: f.stream, status: f.error.response?.status })),
+        streams.length,
+      );
     }
     return jsonResult(result);
   } catch (error) {
@@ -637,82 +1010,109 @@ async function analyzeMessages(request) {
     );
   }
 
-  const { makePath, time } = buildSearch(args);
+  const valueContains = args.valueContains?.toLowerCase();
+
+  // A substring filter has to be applied here rather than pushed into the query,
+  // because Elasticsearch rejects the leading wildcard `field:*foo*` outright. So
+  // ask for a wide bucket list and narrow it locally.
+  const fetchSize = valueContains ? Math.max(size, 1000) : size;
+
+  const searchTypes = [
+    {
+      id: "terms",
+      type: "pivot",
+      rollup: true,
+      row_groups: [{ type: "values", fields: [field], limit: fetchSize }],
+      series: [{ id: "count", type: "count" }],
+    },
+  ];
+
+  if (args.histogramInterval) {
+    searchTypes.push({
+      id: "histogram",
+      type: "pivot",
+      rollup: true,
+      row_groups: [
+        {
+          type: "time",
+          fields: ["timestamp"],
+          interval: {
+            type: "timeunit",
+            timeunit: HISTOGRAM_TIMEUNITS[args.histogramInterval],
+          },
+        },
+      ],
+      series: [{ id: "count", type: "count" }],
+    });
+  }
 
   try {
-    // Terms aggregation: fan out per stream and sum the per-value counts.
-    const { results: perStream, failures } = await fanOut(streams, async (streamId) => {
-      const params = {
-        field,
-        query,
-        ...time,
-        size,
-        filter: `streams:${streamId}`,
-      };
-      return await graylogGet(instance, makePath("terms"), params);
+    // One request covers every stream — the Views API takes them all in its filter.
+    // Any stream the token cannot read is dropped and reported, not fatal.
+    const {
+      results: searchTypeResults,
+      streams: searched,
+      denied,
+    } = await viewsSearchTolerant(instance, {
+      query,
+      streams,
+      timerange: viewsTimeRange(args),
+      searchTypes,
     });
 
-    const counts = {};
-    let missing = 0;
-    let other = 0;
-    for (const data of perStream) {
-      for (const [value, count] of Object.entries(data.terms ?? {})) {
-        counts[value] = (counts[value] ?? 0) + count;
-      }
-      missing += data.missing ?? 0;
-      other += data.other ?? 0;
-    }
-
-    const top = Object.entries(counts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, size)
-      .map(([value, count]) => ({ value, count }));
+    const termsResult = searchTypeResults.terms;
+    let values = pivotRows(termsResult);
+    const matchedTotal = termsResult?.total ?? 0;
 
     const result = {
       field,
       query,
-      streams,
-      top_values: top,
-      missing, // messages in range with no value for this field
-      other, // matches beyond the returned top-N values
+      streams: searched,
+      total_matched: matchedTotal,
     };
-    if (failures.length) {
-      result.failed_streams = failures.map((f) => f.stream);
-      result.warning = partialWarning(failures, streams.length);
+    if (denied.length) {
+      result.failed_streams = denied;
+      result.warning = partialWarning(
+        denied.map((stream) => ({ stream, status: 403 })),
+        streams.length,
+      );
     }
 
-    // Optional time histogram of total match volume (no field breakdown).
-    // Best-effort per stream: the terms result above already reported which
-    // streams the token can't read, so we just merge whatever histograms succeed.
+    if (valueContains) {
+      const scanned = values.length;
+      values = values.filter((v) => String(v.value).toLowerCase().includes(valueContains));
+      result.value_contains = args.valueContains;
+      result.note =
+        `Substring-filtered locally over the ${scanned} most common values of "${field}" ` +
+        `(Elasticsearch cannot match a leading wildcard). A value rarer than those ${scanned} ` +
+        `will not appear — narrow the query or shorten the time range if you expect one.`;
+    }
+
+    const top = values.sort((a, b) => b.count - a.count).slice(0, size);
+    result.top_values = top;
+
+    // Whatever the top values don't account for: messages with no value for this
+    // field, plus any bucket past the cut-off.
+    const covered = top.reduce((n, v) => n + v.count, 0);
+    result.not_in_top_values = Math.max(0, matchedTotal - covered);
+
     if (args.histogramInterval) {
-      const settledHist = await Promise.allSettled(
-        streams.map(async (streamId) => {
-          const params = {
-            query,
-            ...time,
-            interval: args.histogramInterval,
-            filter: `streams:${streamId}`,
-          };
-          const data = await graylogGet(instance, makePath("histogram"), params);
-          return data?.results ?? {};
-        }),
-      );
-      const buckets = {};
-      for (const r of settledHist) {
-        if (r.status !== "fulfilled") continue;
-        for (const [ts, count] of Object.entries(r.value)) {
-          buckets[ts] = (buckets[ts] ?? 0) + count;
-        }
-      }
       result.histogram = {
         interval: args.histogramInterval,
-        buckets: Object.entries(buckets)
-          .sort((a, b) => Number(a[0]) - Number(b[0]))
-          .map(([ts, count]) => ({
-            time: new Date(Number(ts) * 1000).toISOString(),
-            count,
-          })),
+        buckets: pivotRows(searchTypeResults.histogram).map((b) => ({
+          time: b.value,
+          count: b.count,
+        })),
       };
+    }
+
+    if (top.length === 0) {
+      result.why_no_results =
+        matchedTotal > 0
+          ? `${matchedTotal} messages matched the query, but none carry a value for "${field}" ` +
+            `(or none matched valueContains). Confirm the field name with list_fields.`
+          : `The query matched no messages at all in this window. Widen the time range, or run ` +
+            `search with the same query — it will report whether indexing is lagging.`;
     }
 
     if (process.env.DEBUG === "true") {
@@ -724,6 +1124,52 @@ async function analyzeMessages(request) {
     return jsonResult(result);
   } catch (error) {
     return errorResult(instance, "analyzing messages", error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// list_fields — which fields actually exist
+// ---------------------------------------------------------------------------
+
+async function listFields(request) {
+  const args = request.params.arguments ?? {};
+  const { instance, error } = resolveInstance(args);
+  if (error) return error;
+
+  const contains = args.contains?.toLowerCase();
+  const limit = args.limit ?? 100;
+
+  try {
+    const data = await graylogGet(instance, "/api/system/fields");
+    const all = data?.fields ?? [];
+    const matched = contains ? all.filter((f) => f.toLowerCase().includes(contains)) : all;
+    const fields = [...matched].sort().slice(0, limit);
+
+    const result = {
+      total_indexed_fields: all.length,
+      matched: matched.length,
+      returned: fields.length,
+      fields,
+    };
+    if (contains) result.contains = args.contains;
+    if (matched.length > fields.length) {
+      result.note =
+        `${matched.length} fields matched; showing ${fields.length}. Narrow with \`contains\` ` +
+        `or raise \`limit\`.`;
+    }
+    if (!contains && all.length > limit) {
+      result.note =
+        `This cluster indexes ${all.length} fields — far too many to list. Pass \`contains\` ` +
+        `(e.g. "namespace", "pod", "level") to find the one you want.`;
+    }
+    if (matched.length === 0) {
+      result.why_no_results =
+        `No indexed field name contains "${args.contains}". Field names are case-sensitive and ` +
+        `vary by shipper (e.g. namespace_name vs Pod_namespace). Try a shorter substring.`;
+    }
+    return jsonResult(result);
+  } catch (error) {
+    return errorResult(instance, "listing fields", error);
   }
 }
 

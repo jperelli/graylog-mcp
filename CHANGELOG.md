@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-12
+
+General improvements to help minimize back and forth for simple errors or bad searches.
+
+### Fixed
+
+- `analyze` no longer returns 404 on Graylog 6.x.
+- `list_streams` no longer returns a huge response on clusters with many streams.
+- Failed queries that Graylog reports with HTTP 200 are now surfaced as errors.
+
+### Added
+
+- `list_fields` — list the message fields that exist, filtered by `contains`.
+- `analyze` gains `valueContains` — substring-match a field's values.
+- `list_streams` gains `limit` (default 50).
+- `search` gains `messageChars` — max characters of the raw message body per hit.
+- Empty results now carry `why_no_results`, including when Graylog has not indexed the logs yet.
+- Error hints for leading wildcards and removed endpoints.
+
+### Changed
+
+- `search` now returns the parsed `name`, `msg`, `err` and `stack` fields in its concise projection.
+- `search` truncates the raw message body at 500 chars instead of 2,000, cutting a typical response by 60%.
+- `analyze` replaces `missing` and `other` with `total_matched` and `not_in_top_values`.
+- `analyze` now skips unreadable streams, returning results for the rest plus `failed_streams`.
+- Server instructions now teach discovering severity fields rather than guessing `level:ERROR`.
+
+[1.1.0]: https://github.com/jperelli/graylog-mcp/releases/tag/v1.1.0
+
 ## [1.0.0] - 2026-07-11
 
 Initial release of `@jperelli/graylog-mcp`.

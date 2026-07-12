@@ -18,11 +18,51 @@ const SERVER_PATH = fileURLToPath(new URL("../src/index.js", import.meta.url));
 
 export const DEFAULT_STREAM_ID = "000000000000000000000001";
 
-// --- get_message / analyze fixtures -----------------------------------------
+// --- get_message fixtures ---------------------------------------------------
 export const MESSAGE_ID = "abc-123";
 export const MESSAGE_INDEX = "graylog_0";
 export const FULL_MESSAGE = { _id: MESSAGE_ID, source: "api-1", level: 3, message: "boom" };
-export const TERMS = { "api-1": 7, "api-2": 3 };
+
+// --- analyze fixtures -------------------------------------------------------
+// The Views API takes every stream in one request, so these are whole-result
+// counts rather than per-stream ones to be summed.
+export const TERMS = { "api-1": 14, "api-2": 6 };
+// How many messages match the query. A pivot's rollup total counts these
+// regardless of whether they carry the field being broken down — so a field that
+// exists on none of them still reports a non-zero total, which is what lets
+// analyze tell "wrong field name" apart from "no messages at all".
+export const MATCHED_TOTAL = 1000;
+
+// Values for a second field, used to exercise `valueContains` discovery: the
+// caller knows "catalogue" but not the exact namespace.
+export const NAMESPACES = {
+  starrocks: 500,
+  "app-sockshop-catalogue-dev": 275,
+  "app-sockshop-catalogue-qa": 5,
+  "istio-ingress": 100,
+};
+
+// analyze histogram buckets, keyed by the ISO bucket start the Views API returns.
+export const HISTOGRAM = {
+  "2026-07-01T00:00:00.000Z": 6,
+  "2026-07-01T01:00:00.000Z": 10,
+};
+
+// --- list_fields fixtures ---------------------------------------------------
+export const FIELDS = ["message", "namespace_name", "Pod_namespace", "source", "timestamp"];
+
+// --- diagnoseEmpty fixtures -------------------------------------------------
+// A query that matches nothing, so a zero-result search must explain itself.
+export const EMPTY_QUERY = "no_such_field:nope";
+// Stream whose window is empty but which HAS older indexed messages: the shape of
+// a Graylog whose indexing has fallen hours behind ingestion.
+export const STALE_STREAM = "stale";
+export const STALE_TIMESTAMP = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+export const JOURNAL = {
+  uncommitted_journal_entries: 4200,
+  append_events_per_second: 900,
+  read_events_per_second: 100,
+};
 
 // --- list_streams fixtures --------------------------------------------------
 // Returned unsorted and without the default stream, so the server must inject
@@ -33,11 +73,13 @@ export const STREAMS = [
 ];
 
 // --- search fixtures --------------------------------------------------------
-// A message body longer than the 2000-char projection cap, to prove truncation.
+// A message body longer than the projection cap, to prove truncation.
 export const LONG_BODY = "x".repeat(2500);
 // Keyed by stream id. s2 is newer than s1 so the merge must place it first.
 // s1 carries a non-high-signal field (extra_field) that the concise projection
-// must drop.
+// must drop, plus the parsed-JSON fields (msg/name) a shipper extracts from a
+// pino-style line — those are the summary and must survive the projection even
+// though the raw body they came from gets truncated.
 export const SEARCH_HITS = {
   s1: {
     total: 1,
@@ -49,6 +91,8 @@ export const SEARCH_HITS = {
           timestamp: "2026-07-11T10:00:00.000Z",
           source: "api-1",
           level: 3,
+          msg: "Error",
+          name: "CatalogueService",
           message: "older line",
           extra_field: "should-be-dropped-by-concise",
         },
@@ -84,12 +128,26 @@ export const ABSOLUTE_HIT = {
   },
 };
 
-// analyze histogram buckets (unix-second timestamp -> count). Summed per stream.
-export const HISTOGRAM = { 1751328000: 3, 1751331600: 5 };
+// Build the pivot rows the Views API returns: one "leaf" row per bucket, then a
+// trailing "non-leaf" rollup row carrying the grand total.
+function pivotResult(id, buckets, total) {
+  const rows = Object.entries(buckets).map(([key, count]) => ({
+    key: [key],
+    values: [{ key: ["count"], value: count, rollup: true, source: "row-leaf" }],
+    source: "leaf",
+  }));
+  rows.push({
+    key: [],
+    values: [{ key: ["count"], value: total, rollup: true, source: "row-inner" }],
+    source: "non-leaf",
+  });
+  return { id, type: "pivot", rows, total };
+}
 
-// Mock Graylog REST API: answers only the paths the four tools reach. A stream
-// id of "forbidden" returns 403 so we can exercise the partial fan-out path.
-// Anything unexpected 404s so a stray request fails loudly.
+// Mock Graylog REST API: answers only the paths the tools reach, and behaves like
+// Graylog 6 — the legacy universal-search terms/histogram sub-resources are GONE,
+// so a regression back to them 404s here exactly as it does in production.
+// A stream id of "forbidden" returns 403 to exercise the partial fan-out path.
 function startMockGraylog() {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
@@ -100,21 +158,106 @@ function startMockGraylog() {
 
     const path = url.pathname;
 
-    // analyze — terms aggregation
-    if (path === "/api/search/universal/relative/terms") {
-      return json({ terms: TERMS, missing: 1, other: 2, total: 12 });
+    // analyze — Views/Aggregations API. Note it answers 200 even for a failed
+    // query, with the reason in `errors`; the leading-wildcard case below is real
+    // Elasticsearch behaviour and the server must surface it as an error.
+    if (path === "/api/views/search/sync" && req.method === "POST") {
+      let body = "";
+      req.on("data", (c) => {
+        body += c;
+      });
+      return req.on("end", () => {
+        const query = JSON.parse(body).queries[0];
+        const queryString = query.query.query_string;
+        const streams = query.filter.filters.map((f) => f.id);
+
+        // Graylog's real 403 for this NAMES the streams it refused, which is what
+        // lets the server drop them and retry rather than failing the whole call.
+        const forbidden = streams.filter((s) => s === "forbidden");
+        if (forbidden.length > 0) {
+          return json(
+            {
+              type: "MissingStreamPermission",
+              message:
+                "The search is referencing at least one stream you are not permitted to see.",
+              streams: forbidden,
+            },
+            403,
+          );
+        }
+        // A bare `*` (match-all) is fine; a wildcard that OPENS a term is not.
+        if (/(^|[:\s(])[*?]\S/.test(queryString)) {
+          return json({
+            execution: { done: true, cancelled: false, completed_exceptionally: true },
+            results: {
+              q: {
+                errors: [
+                  {
+                    type: "search_type",
+                    description:
+                      "Elasticsearch exception [type=parse_exception, reason=parse_exception: " +
+                      "'*' or '?' not allowed as first character in WildcardQuery].",
+                  },
+                ],
+                search_types: {},
+              },
+            },
+          });
+        }
+
+        const searchTypes = {};
+        for (const st of query.search_types) {
+          const group = st.row_groups[0];
+          if (group.type === "time") {
+            searchTypes[st.id] = pivotResult(st.id, HISTOGRAM, MATCHED_TOTAL);
+          } else {
+            const field = group.fields[0];
+            const buckets =
+              field === "source" ? TERMS : field === "namespace_name" ? NAMESPACES : {};
+            // An unknown field yields no buckets, but the messages still matched.
+            searchTypes[st.id] = pivotResult(st.id, buckets, MATCHED_TOTAL);
+          }
+        }
+        return json({
+          execution: { done: true, cancelled: false, completed_exceptionally: false },
+          results: { q: { errors: [], search_types: searchTypes } },
+        });
+      });
     }
 
-    // analyze — time histogram (only when histogramInterval is set)
-    if (path === "/api/search/universal/relative/histogram") {
-      return json({ results: HISTOGRAM });
+    // list_fields — every indexed field name
+    if (path === "/api/system/fields") {
+      return json({ fields: FIELDS });
+    }
+
+    // diagnoseEmpty — ingest/indexing backlog
+    if (path === "/api/system/journal") {
+      return json(JOURNAL);
     }
 
     // search — universal relative messages, one stream per request
     if (path === "/api/search/universal/relative") {
       const streamId = (url.searchParams.get("filter") ?? "").replace("streams:", "");
+      const query = url.searchParams.get("query");
+      const range = Number(url.searchParams.get("range") ?? 0);
       if (streamId === "forbidden") {
         return json({ message: "Not authorized" }, 403);
+      }
+      // Indexing-lag shape: nothing in a recent window, but older messages exist.
+      // diagnoseEmpty looks back 24h to find the newest thing actually indexed.
+      if (streamId === STALE_STREAM) {
+        if (range >= 86400) {
+          return json({
+            messages: [
+              { index: "idx_stale", message: { _id: "m-stale", timestamp: STALE_TIMESTAMP } },
+            ],
+            total_results: 1,
+          });
+        }
+        return json({ messages: [], total_results: 0 });
+      }
+      if (query === EMPTY_QUERY) {
+        return json({ messages: [], total_results: 0 });
       }
       const hit = SEARCH_HITS[streamId] ?? { total: 0, messages: [] };
       return json({ messages: hit.messages, total_results: hit.total });
@@ -184,12 +327,17 @@ export async function startHarness() {
       GRAYLOG_API_TOKEN_INSTANCE_1: "test-token",
     },
   });
-  const client = new Client({ name: "graylog-mcp-smoke-test", version: "1.0.0" });
+  const client = new Client({ name: "graylog-mcp-smoke-test", version: "1.1.0" });
   await client.connect(transport);
 
   return {
     async call(name, args = {}) {
       return parseToolJson(await client.callTool({ name, arguments: args }));
+    },
+    // The unparsed result. Error paths return prose rather than JSON, so tests
+    // that assert on a failure message use this instead of `call`.
+    async callRaw(name, args = {}) {
+      return client.callTool({ name, arguments: args });
     },
     async close() {
       await client.close().catch(() => {});

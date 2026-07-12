@@ -11,7 +11,9 @@ A minimal MCP (Model Context Protocol) server in JavaScript that integrates with
 ## Features
 
 - JavaScript MCP server
-- Tools: `list_streams` (discover readable streams), `search` (read matching log lines across multiple streams), `analyze` (aggregate matches by a field, with an optional time histogram), and `get_message` (fetch one full document)
+- Tools: `search` (read matching log lines across multiple streams), `analyze` (aggregate matches by a field, with an optional time histogram), `list_fields` (which fields exist), `list_streams` (discover readable streams), and `get_message` (fetch one full document)
+- **Empty results explain themselves.** A zero-match search reports whether the query is wrong, the window is quiet, or Graylog simply hasn't *indexed* the logs yet — three causes that otherwise look identical and send an agent in circles
+- **Discovery over guessing.** `list_fields` and `analyze`'s `valueContains` let an agent look up real field names and values instead of inventing them, since a wrong guess returns 0 hits and reads as "no logs exist"
 - Token-efficient by design, `search` returns a concise projection of high-signal fields by default; opt into full documents with `verbose`
 - A server-level "instructions" manual teaches the client the query syntax, stream-scoping rules, and severity quirks up front
 - Multi-instance support, query multiple Graylog servers from a single MCP server
@@ -109,69 +111,115 @@ Use the same JSON structure shown above for Cursor.
 
 ## Use
 
-Once configured, the tools become available and are called automatically when needed. The usual flow is to list streams to find the relevant stream IDs, then `analyze` to spot patterns and/or `search` to read individual lines, and `get_message` to inspect one hit in full. Example prompts:
+Once configured, the tools become available and are called automatically when needed. The usual flow is to search the Default Stream (`000000000000000000000001`), which covers everything the token can read, then `analyze` to spot patterns, `search` to read individual lines, and `get_message` to inspect one hit in full. Reach for `list_streams` only to scope to a specific named stream. Example prompts:
 
 ```
-List the Graylog streams that mention "payments".
-```
-
-```
-Search the payments streams for errors in the last 15 minutes.
-Query the "staging" Graylog instance.
+Search Graylog for errors in the payments namespace in the last 15 minutes.
+Query the "staging" instance.
 ```
 
 ```
-In the payments streams, which sources produced the most errors in the last hour?
+Which containers produced the most errors in the last hour?
 ```
+
+```
+Which namespaces have "payments" in the name?
+```
+
+**Don't let the agent guess field names or values.** A query on a field or value that doesn't exist matches nothing, which looks exactly like "there are no logs". `list_fields` answers which fields exist, and `analyze` with `valueContains` answers which values a field actually has.
 
 
 ## Available tools
 
 ### list_streams
 
-List the streams the configured API token can read (id + title). Use this first to discover stream IDs for `search`. The token may only have access to a subset of streams; only readable ones are returned.
+List the streams the configured API token can read (id + title). Only readable ones are returned.
+
+You usually **don't need this**: pass the Default Stream id `000000000000000000000001` to `search`/`analyze` to cover everything the token can read. A cluster can hold thousands of streams (the author's has 1,205), so output is capped — use `titleContains` when you want one specific named stream.
 
 Parameters:
 
 - `instance` (string, optional): Label of the Graylog instance to query. Defaults to the first configured instance.
-- `titleContains` (string, optional): Case-insensitive substring filter on the stream title (e.g. `bocato`).
+- `titleContains` (string, optional): Case-insensitive substring filter on the stream title (e.g. `catalogue`).
+- `limit` (number, optional): Max streams to return. Default: `50`. The Default Stream is always included and never counts against the cap.
+
+### list_fields
+
+List the message fields that actually exist in the index. Use it **before** searching on a field you haven't seen in a result, so you never guess a field name.
+
+A cluster indexes thousands of fields (the author's: 3,269), and near-duplicates are common — `namespace_name`, `Pod_namespace`, `pod_namespace` and `Namespace` may all exist while only one is populated by your shipper. Pass `contains` to narrow.
+
+Parameters:
+
+- `contains` (string, optional): Case-insensitive substring filter on the field name, e.g. `namespace`, `pod`, `level`.
+- `limit` (number, optional): Max field names to return. Default: `100`.
+- `instance` (string, optional): Instance label. Defaults to the first configured instance.
 
 ### search
 
-Read matching log lines across one or more streams, merged newest-first. By default it returns a **concise projection** of high-signal fields (`timestamp`, `source`, `level`, `container_name`, `pod_name`, `namespace_name`, `application_name`, `service`, `logger_name`, `message`) plus each hit's `_id`/`_index`, with long `message` bodies truncated, this keeps the agent's context small. Set `verbose: true` (or pass explicit `fields`) to get every populated field, untruncated. Stream IDs are **required**, an all-streams search is not performed implicitly, because a limited-permission token would be rejected with `403 Not authorized`.
+Read matching log lines across one or more streams, merged newest-first. By default it returns a **concise projection** of high-signal fields (`timestamp`, `source`, `level`, `container_name`, `pod_name`, `namespace_name`, `application_name`, `service`, `logger_name`, `name`, `msg`, `err`, `stack`, `message`) plus each hit's `_id`/`_index`, with the raw `message` body truncated to 500 chars, this keeps the agent's context small. Set `verbose: true` (or pass explicit `fields`) to get every populated field, untruncated. Stream IDs are **required**, an all-streams search is not performed implicitly, because a limited-permission token would be rejected with `403 Not authorized`.
+
+`name`/`msg`/`err`/`stack` are there because a shipper that parses a JSON log line (pino, bunyan, structlog) extracts its keys into real fields. Those fields *are* the summary of the event, and they're cheap — the raw `message` body that contains them is neither, which is why it's truncated hard by default.
+
+> **Reach for `analyze` before `search`.** Raw lines are the most expensive thing this server returns. A hundred repetitions of one error cost a hundred times as much via `search` as one aggregated row via `analyze`, and tell you less. Use `search` once you know which line you want.
 
 > **Tip:** to search everything the token can see (including messages not routed to a named stream), pass the Default Stream id `000000000000000000000001`. `list_streams` also surfaces it.
 
 Parameters:
 
-- `query` (string, **required**): Search query, using Graylog/Elasticsearch syntax. Examples: `level:ERROR`, `msg:Error`, `error OR exception`, `*`.
+- `query` (string, **required**): Search query, using Graylog/Elasticsearch syntax. Examples: `msg:Error`, `namespace_name:app-payments-qa AND error`, `source:api-*`, `*`.
 - `streams` (string, **required**): Comma-separated stream IDs to search. Get them from `list_streams`.
 - `instance` (string, optional): Label of the Graylog instance to query. Defaults to the first configured instance.
 - `searchTimeRangeInSeconds` (number, optional): Relative time range in seconds. Default: `900` (15 minutes).
 - `from` / `to` (string, optional): Absolute window in ISO-8601 UTC (e.g. `2026-07-11 14:00:00`). When both are set they override the relative range, use them to investigate a known incident window.
 - `searchCountLimit` (number, optional): Max number of messages. Default: `50`.
+- `messageChars` (number, optional): Max characters of the raw message body per hit. Default: `500`. Raise it only when the detail you need lives in the raw body rather than the parsed fields.
 - `verbose` (boolean, optional): Return every populated field, untruncated, instead of the concise projection. Default: `false`.
 - `fields` (string, optional): Comma-separated explicit field list to return. Overrides the concise projection.
 
-The response is `{ returned, total_matched, streams, messages, note?, projection? }`, where `total_matched` is the total number of hits across the streams (may exceed `returned`, which is capped by `searchCountLimit`); when it does, `note` explains how to see more.
+The response is `{ returned, total_matched, streams, messages, note?, projection?, why_no_results? }`, where `total_matched` is the total number of hits across the streams (may exceed `returned`, which is capped by `searchCountLimit`); when it does, `note` explains how to see more.
 
-> **Note on log levels:** some services log severity as a numeric field *inside* the JSON message body (e.g. pino: `{"level":50}` = error, `40` = warn) rather than a top-level Graylog `level` field. For those, filter by message text (e.g. `msg:Error` or `error OR exception`) instead of `level:ERROR`. Avoid `"level":50` as a query, a quoted string before `:` is invalid Lucene.
+**When a search matches nothing, it tells you why.** A bare `total_matched: 0` is ambiguous, and the three causes need opposite responses, so `why_no_results` names the one that applies:
+
+- *The window has messages, but none match.* The streams and time range are fine, so the query is wrong — usually a guessed field name or value. Confirm with `list_fields` / `analyze`.
+- *The window is empty, and indexing is current.* These streams are genuinely quiet.
+- *The window is empty, and the newest indexed message is hours old.* **Graylog is still indexing.** The logs exist and have been received; they just aren't searchable yet. The response reports how far behind indexing is and the journal backlog. Don't conclude the logs are missing — widen the range or retry.
+
+That last case is easy to misread as "this service produced no logs", and it's the reason this project exists in its current shape: the pipeline can lag ingestion by hours under load.
+
+> **Note on log levels — severity must be discovered, not guessed.** Some services emit a top-level Graylog `level` (syslog: 3=error, 4=warn). Others log JSON, and the shipper extracts its keys into their *own* fields: pino's `{"level":50,"msg":"Error","name":"SvcX"}` typically becomes fields `msg` and `name`, while its numeric `level` is **lost** — it collides with the container's own `level` (often `7`), so `level:50` and `level:ERROR` both match **nothing** even though the errors are plainly there. Guessing a disjunction like `level:ERROR OR level:50 OR error OR exception OR fatal` is how agents waste turns. Instead run `list_fields` (`contains: "level"`, `"msg"`, `"err"`), then `analyze` on `msg` to see the actual values. Free-text `error` works as a fallback; don't assume `exception` or `fatal` exist. And avoid `"level":50` as a query, a quoted string before `:` is invalid Lucene.
 
 ### analyze
 
-Aggregate matching messages by the **top values of a field** instead of returning raw lines, e.g. which `source`, `container_name`, or `level` dominates the errors in a window. Optionally add a **time histogram** of total match volume. Reach for this first during an incident: it's far cheaper on context than pulling raw rows, and it surfaces patterns directly.
+Aggregate matching messages by the **top values of a field** instead of returning raw lines, e.g. which `source`, `container_name`, or `level` dominates the errors in a window. Optionally add a **time histogram** of total match volume. Two uses:
+
+1. **Find what is failing.** Aggregate on a message field (`msg`, or whatever short summary field `list_fields` reveals) to collapse a thousand repetitions of one error into a single row with a count; on `name` / `container_name` / `source` to see who is emitting them. This is the fastest route from "is anything weird?" to an answer — and it costs a few hundred tokens where the equivalent `search` costs tens of thousands:
+
+   ```
+   analyze field:msg    → 1386  Error
+                            60  rabbitmq pub/sub: publishing to …exchange failed
+   analyze field:name   → 1290  CatalogueService
+                            96  ShippingService
+   ```
+
+2. **Discover a value before filtering on it.** Set `valueContains` to find the exact name of a namespace/pod/service you only half-know. Elasticsearch rejects a leading wildcard, so `namespace_name:*catalogue*` is a hard error, not an empty result — this is the only way to substring-match a value.
 
 Parameters:
 
-- `field` (string, **required**): Field to break down by, e.g. `source`, `container_name`, `level`, `status_code`.
-- `streams` (string, **required**): Comma-separated stream IDs. Get them from `list_streams`.
+- `field` (string, **required**): Field to break down by, e.g. `source`, `namespace_name`, `container_name`, `level`. Confirm it exists with `list_fields` if you haven't seen it in a result.
+- `streams` (string, **required**): Comma-separated stream IDs, or the Default Stream id.
 - `query` (string, optional): Lucene filter applied before aggregating. Default: `*`.
+- `valueContains` (string, optional): Case-insensitive substring filter on the returned **values**, applied locally over a wide bucket scan.
 - `instance` (string, optional): Instance label. Defaults to the first configured instance.
 - `searchTimeRangeInSeconds` (number, optional): Relative range in seconds. Default: `900`. Or use `from`/`to` for an absolute window.
 - `size` (number, optional): Number of top values to return. Default: `20`.
 - `histogramInterval` (string, optional): One of `minute`, `hour`, `day`, `week`, `month`. When set, the response also includes a time histogram of match counts.
 
-The response is `{ field, query, streams, top_values: [{ value, count }], missing, other, histogram? }`, where `missing` counts matches with no value for the field and `other` counts matches beyond the returned top-N.
+The response is `{ field, query, streams, total_matched, top_values: [{ value, count }], not_in_top_values, histogram?, note?, warning?, failed_streams?, why_no_results? }`, where `not_in_top_values` counts matches that the returned values don't account for — messages with no value for the field, plus any bucket past the cut-off.
+
+A stream the token can't read is **skipped, not fatal**: you get the aggregation over the readable streams plus `failed_streams` and a `warning` naming the ones excluded, in the same response.
+
+> Implemented on Graylog's **Views/Aggregations API** (`POST /api/views/search/sync`), which takes every stream in a single request. The legacy `search/universal/*/terms` and `/histogram` endpoints this originally used were **removed in Graylog 6.0** and return `404` there.
 
 ### get_message
 
