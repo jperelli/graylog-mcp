@@ -261,7 +261,8 @@ function startMockGraylog() {
           return json(
             {
               type: "ApiError",
-              message: "Unable to map property fields.\nKnown properties include: field, limit, type",
+              message:
+                "Unable to map property fields.\nKnown properties include: field, limit, type",
             },
             400,
           );

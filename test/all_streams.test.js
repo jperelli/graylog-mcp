@@ -42,7 +42,10 @@ test('search streams:"*" honors verbose and an explicit field list', async () =>
 
 test('analyze streams:"*" aggregates across every readable stream in one request', async () => {
   const agg = await h.call("analyze", { field: "source", streams: "*" });
-  assert.deepEqual(agg.top_values.map((v) => v.value), ["api-1", "api-2"]);
+  assert.deepEqual(
+    agg.top_values.map((v) => v.value),
+    ["api-1", "api-2"],
+  );
   assert.match(String(agg.streams), /readable streams/, "streams summarised for the wildcard");
 });
 
@@ -57,7 +60,11 @@ test("a Default-Stream-only search that finds nothing points at streams:*", asyn
 
 test("list_streams reports which streams remove their matches from the Default Stream", async () => {
   const streams = await h.call("list_streams");
-  assert.equal(streams.streams_removing_from_default, 1, "Zeta removes-from-default, Alpha does not");
+  assert.equal(
+    streams.streams_removing_from_default,
+    1,
+    "Zeta removes-from-default, Alpha does not",
+  );
   assert.match(streams.default_stream_note, /streams:"\*"/);
   const zeta = streams.streams.find((s) => s.title === "Zeta");
   assert.equal(zeta.removes_from_default_stream, true);

@@ -594,7 +594,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "list_streams",
         description:
           "List the Graylog streams the API token can read (id + title, and whether each removes " +
-          "its matches from the Default Stream). To search everything, pass streams:\"*\" to " +
+          'its matches from the Default Stream). To search everything, pass streams:"*" to ' +
           "search/analyze rather than listing streams here. A cluster can hold thousands of " +
           "streams, so results are capped — use `titleContains` to find one specific named stream " +
           "(e.g. a service whose logs are absent from the Default Stream).",
@@ -645,7 +645,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           "Returns a concise projection of high-signal fields by default (set verbose:true for " +
           "all fields). Raw lines are expensive: if you want to know WHAT is failing rather than " +
           "read specific lines, use analyze first — a hundred repetitions of one error cost a " +
-          "hundred times as much here as one aggregated count. Pass streams:\"*\" to cover every " +
+          'hundred times as much here as one aggregated count. Pass streams:"*" to cover every ' +
           "readable stream when you do not know which stream a service logs to (the Default " +
           "Stream often excludes it).",
         inputSchema: {
@@ -695,7 +695,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           "(3) DISCOVER A VALUE you are about to filter on — set `valueContains` to find the " +
           "real name of a namespace/pod/service rather than guessing it (Elasticsearch rejects " +
           "a leading wildcard, so `field:*foo*` is an error and this is the only way to " +
-          "substring-match a value). Pass streams:\"*\" to aggregate across every readable " +
+          'substring-match a value). Pass streams:"*" to aggregate across every readable ' +
           "stream in one request — cheap here, and the reliable way to see a service whose " +
           "stream removes its matches from the Default Stream.",
         inputSchema: {
