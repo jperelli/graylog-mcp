@@ -66,11 +66,45 @@ export const JOURNAL = {
 
 // --- list_streams fixtures --------------------------------------------------
 // Returned unsorted and without the default stream, so the server must inject
-// the default stream and sort by title.
+// the default stream and sort by title. Zeta removes its matches from the Default
+// Stream (the routing option that makes a Default-Stream-only search miss it),
+// Alpha does not — so list_streams must report the flag and the count.
 export const STREAMS = [
-  { id: "s-zeta", title: "Zeta", description: "z", disabled: false },
-  { id: "s-alpha", title: "Alpha", description: "a", disabled: false },
+  {
+    id: "s-zeta",
+    title: "Zeta",
+    description: "z",
+    disabled: false,
+    remove_matches_from_default_stream: true,
+  },
+  {
+    id: "s-alpha",
+    title: "Alpha",
+    description: "a",
+    disabled: false,
+    remove_matches_from_default_stream: false,
+  },
 ];
+
+// --- streams:"*" (all-streams search) fixtures ------------------------------
+// A hit that lives ONLY in Zeta, which removes its matches from the Default
+// Stream. So a Default-Stream-only search never sees it, but streams:"*" (which
+// expands to every readable stream and queries them via the Views `messages`
+// search type) must. Keyed by stream id.
+export const WILDCARD_HIT = {
+  index: "idx_zeta",
+  message: {
+    _id: "m-zeta",
+    gl2_message_id: "m-zeta",
+    timestamp: "2026-07-11T12:00:00.000Z",
+    source: "bocato-1",
+    namespace_name: "app-marketing-bocato-prod",
+    msg: "validate failed",
+    level: 3,
+    extra_field: "dropped-by-concise",
+  },
+};
+const VIEWS_MESSAGES = { "s-zeta": [WILDCARD_HIT] };
 
 // --- search fixtures --------------------------------------------------------
 // A message body longer than the projection cap, to prove truncation.
@@ -111,6 +145,18 @@ export const SEARCH_HITS = {
           level: 6,
           message: LONG_BODY,
         },
+      },
+    ],
+  },
+  // The Default Stream holds infra logs (so a "*" probe finds the window is not
+  // empty) but NOT the service the caller wants — the shape that makes
+  // diagnoseEmpty steer a Default-Stream-only search toward streams:"*".
+  [DEFAULT_STREAM_ID]: {
+    total: 3,
+    messages: [
+      {
+        index: "idx_def",
+        message: { _id: "m-def", timestamp: "2026-07-11T09:00:00.000Z", source: "infra" },
       },
     ],
   },
@@ -205,13 +251,51 @@ function startMockGraylog() {
           });
         }
 
+        // Graylog 4.2 only knows the SINGULAR `field` on a row_group and 400s on
+        // the 6.x-only `fields` array. Emulate that so a regression back to
+        // `fields` (which breaks the older prod cluster) fails loudly here.
+        const badGroup = query.search_types.find(
+          (st) => Array.isArray(st.row_groups) && st.row_groups[0] && "fields" in st.row_groups[0],
+        );
+        if (badGroup) {
+          return json(
+            {
+              type: "ApiError",
+              message: "Unable to map property fields.\nKnown properties include: field, limit, type",
+            },
+            400,
+          );
+        }
+
         const searchTypes = {};
         for (const st of query.search_types) {
+          // Views `messages` search type — the streams:"*" search path. Gather the
+          // hits for every stream in the filter, newest-first, capped to `limit`.
+          if (st.type === "messages") {
+            const hits = streams.flatMap((sid) => VIEWS_MESSAGES[sid] ?? []);
+            hits.sort((a, b) =>
+              String(b.message.timestamp ?? "").localeCompare(String(a.message.timestamp ?? "")),
+            );
+            searchTypes[st.id] = {
+              id: st.id,
+              type: "messages",
+              messages: hits.slice(0, st.limit ?? 150),
+              total: null,
+            };
+            continue;
+          }
           const group = st.row_groups[0];
+          // A pivot with NO row_groups is the grand-total rollup the "*" search
+          // rides along with the messages type to report total_matched.
+          if (!group) {
+            const total = streams.reduce((n, sid) => n + (VIEWS_MESSAGES[sid]?.length ?? 0), 0);
+            searchTypes[st.id] = pivotResult(st.id, {}, total);
+            continue;
+          }
           if (group.type === "time") {
             searchTypes[st.id] = pivotResult(st.id, HISTOGRAM, MATCHED_TOTAL);
           } else {
-            const field = group.fields[0];
+            const field = group.field;
             const buckets =
               field === "source" ? TERMS : field === "namespace_name" ? NAMESPACES : {};
             // An unknown field yields no buckets, but the messages still matched.

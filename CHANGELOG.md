@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-16
+
+Support for mixed Graylog versions and searching across all streams.
+
+### Fixed
+
+- `analyze` now works on Graylog 4.2 as well as 6.x.
+- Searches no longer assume the Default Stream contains every message.
+
+### Added
+
+- `search` and `analyze` accept `streams:"*"` to query every readable stream.
+- `list_streams` reports each stream's `removes_from_default_stream` flag.
+- Empty Default-Stream searches now suggest retrying with `streams:"*"`.
+
+### Changed
+
+- Server instructions now explain the wildcard query rules in full.
+
+[1.2.0]: https://github.com/jperelli/graylog-mcp/releases/tag/v1.2.0
+
 ## [1.1.0] - 2026-07-12
 
 General improvements to help minimize back and forth for simple errors or bad searches.

@@ -53,14 +53,35 @@ Cross-tool guidance (query syntax, stream-scoping, severity quirks) lives in the
 - Auth is HTTP Basic: username = API token, password = the literal `"token"`.
 - Every request needs the `X-Requested-By` header or Graylog returns **403** (CSRF).
 - Stream scoping is **mandatory** — a limited-permission token gets 403 on an unscoped
-  search. Use the Default Stream id `000000000000000000000001` to search everything visible.
-  Prefer it: a real cluster can have thousands of streams (nonprod has 1,205).
+  search. `search`/`analyze` accept `streams:"*"`, which the server expands to every stream
+  the token can read (via `resolveStreamIds` → `readableStreamIds`, cached 5 min) and passes
+  as the concrete id list.
+- **The Default Stream `000000000000000000000001` is NOT "everything".** A stream with
+  `remove_matches_from_default_stream: true` pulls its matches *out* of the Default Stream, so
+  a Default-Stream-only search silently misses that whole service. This is extremely common:
+  prod had **360 of 361** streams set that way, which is why searching the Default Stream for
+  bocato returned 0 while the dedicated `[PROD] bocato-event-validation-service` stream held
+  181k messages (incl. real `level:3` errors). So: prefer `streams:"*"` when you don't already
+  know the stream; `list_streams` surfaces the `removes_from_default_stream` flag and a count.
+  `diagnoseEmpty` adds a remove-from-default hint when a Default-Stream-only search finds
+  nothing but the window has data.
+- **`streams:"*"` search uses the Views `messages` search type**, not the legacy per-stream
+  endpoint — one request across all streams (a `total` rollup pivot rides along for
+  `total_matched`) instead of hundreds of fan-out calls. Verified on both 4.2 and 6.x. Explicit
+  streams still use the legacy fan-out path unchanged.
 - **Graylog 6.0 removed the universal-search `/terms` and `/histogram` sub-resources.** They
   404 while the plain `/api/search/universal/{relative,absolute}` endpoints still work. So:
   - `search` uses the legacy endpoint (one stream per request, fanned out and merged).
   - `analyze` uses the Views API (`POST /api/views/search/sync`) — all streams in one
     request, no fan-out. Don't "restore" the old terms endpoints; the mock in `test/helpers.js`
     404s them on purpose so a regression fails loudly.
+- **Instances can run different Graylog major versions** — e.g. nonprod is 6.0.7 while prod is
+  4.2.13. The tools support both without probing the version, but the Views API pivot schema is
+  the trap: a `row_groups` entry must use the **singular `field`** (`{type:"values", field, limit}`
+  and `{type:"time", field:"timestamp", ...}`), *not* the array `fields:[...]`. Graylog 6.x accepts
+  both forms, but 4.2 knows only `field` and 400s on `fields` with "Unable to map property fields.
+  Known properties include: field, limit, type". Singular is the one form both accept. The mock 400s
+  the array form on purpose so a regression back to `fields` fails loudly.
 - **The Views API answers HTTP 200 even when the query failed**, with the reason in
   `results.q.errors`. Always check it, or a broken query reads as zero results.
 - A stream the token can't read **403s the whole Views request** — but the body
