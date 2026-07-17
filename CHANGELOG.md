@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-16
+
+Cosmetic semver issue sync mcp registry vs npmjs
+
+[1.3.0]: https://github.com/jperelli/graylog-mcp/releases/tag/v1.3.0
+
 ## [1.2.0] - 2026-07-16
 
 Support for mixed Graylog versions and searching across all streams.

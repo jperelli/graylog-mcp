@@ -1,6 +1,6 @@
 {
   "name": "@jperelli/graylog-mcp",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "MCP server for fetching data from Graylog",
   "mcpName": "io.github.jperelli/graylog-mcp",
   "main": "src/index.js",
