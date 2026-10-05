@@ -33,7 +33,8 @@ stdout that isn't a JSON-RPC frame breaks the protocol — log to **stderr** onl
 ## Configuration model
 
 Instances are configured via numbered env vars: `GRAYLOG_BASE_URL_INSTANCE_N`,
-`GRAYLOG_API_TOKEN_INSTANCE_N`, and optional `GRAYLOG_LABEL_INSTANCE_N`. Instance 1 also
+`GRAYLOG_API_TOKEN_INSTANCE_N`, and optional `GRAYLOG_LABEL_INSTANCE_N` and
+`GRAYLOG_AUTH_INSTANCE_N` (`basic`/`bearer`). Instance 1 also
 falls back to the legacy `BASE_URL` / `API_TOKEN`. Only instances with both URL and token
 are active; the first is the default.
 
@@ -50,7 +51,8 @@ Cross-tool guidance (query syntax, stream-scoping, severity quirks) lives in the
 
 ## Graylog specifics to remember
 
-- Auth is HTTP Basic: username = API token, password = the literal `"token"`.
+- Auth is HTTP Basic: username = API token, password = the literal `"token"`. With
+  `GRAYLOG_AUTH_INSTANCE_N=bearer` the token goes out as `Authorization: Bearer` instead.
 - Every request needs the `X-Requested-By` header or Graylog returns **403** (CSRF).
 - Stream scoping is **mandatory** — a limited-permission token gets 403 on an unscoped
   search. `search`/`analyze` accept `streams:"*"`, which the server expands to every stream

@@ -31,12 +31,20 @@ function loadInstances() {
       (i === 1 ? process.env.API_TOKEN : null) ??
       null;
     const label = process.env[`GRAYLOG_LABEL_INSTANCE_${i}`] ?? `instance_${i}`;
+    const auth = process.env[`GRAYLOG_AUTH_INSTANCE_${i}`] ?? "basic";
+
+    if (auth !== "basic" && auth !== "bearer") {
+      console.error(
+        `[graylog-mcp] Skipping instance ${i}: GRAYLOG_AUTH_INSTANCE_${i} must be "basic" or "bearer", got "${auth}".`,
+      );
+      continue;
+    }
 
     if (baseUrl && apiToken) {
       // Strip trailing slashes so we don't build "host//api/..." — Graylog
       // routes the double-slash path to its web UI (HTML) instead of the REST API.
       const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
-      instances.push({ label, baseUrl: normalizedBaseUrl, apiToken });
+      instances.push({ label, baseUrl: normalizedBaseUrl, apiToken, auth });
     }
   }
 
@@ -158,10 +166,17 @@ const server = new Server(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+// Graylog API tokens authenticate via HTTP Basic: username=<token>, password="token".
+// Some deployments put Graylog behind a proxy that takes an OAuth bearer token
+// instead, selected per instance with GRAYLOG_AUTH_INSTANCE_N=bearer.
+function authHeader(instance) {
+  if (instance.auth === "bearer") return `Bearer ${instance.apiToken}`;
+  return `Basic ${Buffer.from(`${instance.apiToken}:token`).toString("base64")}`;
+}
+
 // Authenticated GET against a Graylog instance, returning parsed JSON.
 //
-// Graylog's CSRF protection rejects API requests without X-Requested-By (403),
-// and API tokens authenticate via HTTP Basic: username=<token>, password="token".
+// Graylog's CSRF protection rejects API requests without X-Requested-By (403).
 // Non-2xx responses throw an Error whose `.response` carries { status, data },
 // matching the axios shape that errorResult reads.
 async function graylogGet(instance, path, params = {}) {
@@ -170,14 +185,13 @@ async function graylogGet(instance, path, params = {}) {
     if (value !== undefined && value !== null) url.searchParams.set(key, value);
   }
 
-  const auth = Buffer.from(`${instance.apiToken}:token`).toString("base64");
   let resp;
   try {
     resp = await fetch(url, {
       headers: {
         Accept: "application/json",
         "X-Requested-By": "graylog-mcp",
-        Authorization: `Basic ${auth}`,
+        Authorization: authHeader(instance),
       },
       // Fail fast on a hung or unreachable instance instead of blocking the tool call.
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -210,7 +224,6 @@ async function graylogGet(instance, path, params = {}) {
 // Authenticated POST with a JSON body. Same auth/CSRF rules as graylogGet; the
 // Views search API (see viewsSearch) is POST-only.
 async function graylogPost(instance, path, body) {
-  const auth = Buffer.from(`${instance.apiToken}:token`).toString("base64");
   let resp;
   try {
     resp = await fetch(new URL(instance.baseUrl + path), {
@@ -219,7 +232,7 @@ async function graylogPost(instance, path, body) {
         Accept: "application/json",
         "Content-Type": "application/json",
         "X-Requested-By": "graylog-mcp",
-        Authorization: `Basic ${auth}`,
+        Authorization: authHeader(instance),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

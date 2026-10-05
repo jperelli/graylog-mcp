@@ -31,6 +31,7 @@ Configure one or more Graylog instances using numbered env vars:
 | `GRAYLOG_BASE_URL_INSTANCE_N` | yes | Graylog base URL for instance N |
 | `GRAYLOG_API_TOKEN_INSTANCE_N` | yes | API token for instance N |
 | `GRAYLOG_LABEL_INSTANCE_N` | no | Human-readable label (default: `instance_N`) |
+| `GRAYLOG_AUTH_INSTANCE_N` | no | `basic` (default) sends the token as a Graylog API token; `bearer` sends it as `Authorization: Bearer <token>`, for Graylog behind an OAuth proxy |
 
 Replace `N` with `1`, `2`, `3`, … to register as many instances as needed. Only instances with both `BASE_URL` and `API_TOKEN` set will be active.
 

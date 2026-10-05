@@ -195,7 +195,9 @@ function pivotResult(id, buckets, total) {
 // so a regression back to them 404s here exactly as it does in production.
 // A stream id of "forbidden" returns 403 to exercise the partial fan-out path.
 function startMockGraylog() {
+  const authHeaders = [];
   const server = http.createServer((req, res) => {
+    authHeaders.push(req.headers.authorization);
     const url = new URL(req.url, "http://localhost");
     const json = (obj, status = 200) => {
       res.writeHead(status, { "Content-Type": "application/json" });
@@ -385,7 +387,7 @@ function startMockGraylog() {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
-      resolve({ server, baseUrl: `http://127.0.0.1:${port}` });
+      resolve({ server, baseUrl: `http://127.0.0.1:${port}`, authHeaders });
     });
   });
 }
@@ -400,8 +402,9 @@ function parseToolJson(result) {
 
 // Start the mock Graylog and a connected MCP client pointed at the real server.
 // Returns `call(tool, args)` (parsed JSON payload) and `close()` for teardown.
-export async function startHarness() {
-  const { server, baseUrl } = await startMockGraylog();
+// `env` adds to or overrides the server's environment.
+export async function startHarness(env = {}) {
+  const { server, baseUrl, authHeaders } = await startMockGraylog();
 
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -410,12 +413,15 @@ export async function startHarness() {
       ...getDefaultEnvironment(),
       GRAYLOG_BASE_URL_INSTANCE_1: baseUrl,
       GRAYLOG_API_TOKEN_INSTANCE_1: "test-token",
+      ...env,
     },
   });
   const client = new Client({ name: "graylog-mcp-smoke-test", version: "1.1.0" });
   await client.connect(transport);
 
   return {
+    // Authorization header of every request the mock received, in order.
+    authHeaders,
     async call(name, args = {}) {
       return parseToolJson(await client.callTool({ name, arguments: args }));
     },
